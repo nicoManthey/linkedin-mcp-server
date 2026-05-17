@@ -151,7 +151,7 @@ def register_job_tools(
             raise_tool_error(e, "search_jobs")  # NoReturn
 
     @mcp.tool(
-        timeout=TOOL_TIMEOUT_SECONDS,
+        timeout=tool_timeout,
         title="Get Saved Jobs",
         annotations={"readOnlyHint": True, "openWorldHint": True},
         tags={"job", "scraping"},

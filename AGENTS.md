@@ -27,10 +27,11 @@ All scraping tools return: `{url, sections: {name: raw_text}}`.
 
 Optional additional keys:
 
-- `references: {section_name: [{kind, url, text?, context?}]}` — LinkedIn URLs are relative paths
+- `references: {section_name: [{kind, url, text?, context?, value?}]}` — LinkedIn URLs are relative paths; `value` carries non-URL identifiers (e.g. company URN id for `kind: "company_urn"`)
 - `section_errors: {section_name: {error_type, error_message, issue_template_path, runtime, ...}}`
 - `unknown_sections: [name, ...]`
 - `job_ids: [id, ...]` (search_jobs, get_saved_jobs)
+- `references["feed"]` (get_feed only) — every entry is `kind: "feed_post"`; non-post anchors (sidebar profiles, employer logos) are filtered. URLs may carry either `/feed/update/<urn>/` (DOM-anchor-derived) or `/posts/<slug>` (SDUI-derived) form; both are valid LinkedIn permalinks. Cap is 50 entries, matching `get_feed`'s `num_posts` ceiling.
 
 ## Verifying Bug Reports
 
@@ -81,6 +82,7 @@ After the workflow completes, file a PR in the MCP registry to update the versio
 Always read [`CONTRIBUTING.md`](CONTRIBUTING.md) before filing an issue or working on this repository.
 
 - Write a short synthetic prompt that would reproduce the PR diff if given to a fresh Claude Code session. Don't copy the user's first message — distill the conversation into a single instruction that captures the full scope of changes. This tells the maintainer what was intended, which is often more useful than reviewing the full diff. Use a Markdown blockquote under a `## Synthetic prompt` heading, followed by the model attribution:
+
   ```
   ## Synthetic prompt
 
@@ -88,6 +90,7 @@ Always read [`CONTRIBUTING.md`](CONTRIBUTING.md) before filing an issue or worki
 
   Generated with <model name and version>
   ```
+
 - When implementing a new feature/fix:
   1. Check open issues. If no issue exists, create one following the templates in `.github/ISSUE_TEMPLATE/`. Fill in every section; delete optional sections if not applicable.
   2. Branch from `main`: `feature/issue-number-short-description`

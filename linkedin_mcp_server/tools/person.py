@@ -9,6 +9,7 @@ import logging
 from typing import Annotated, Any
 
 from fastmcp import Context, FastMCP
+from fastmcp.exceptions import ToolError
 from pydantic import Field
 
 from linkedin_mcp_server.callbacks import MCPContextProgressCallback
@@ -17,6 +18,7 @@ from linkedin_mcp_server.core.exceptions import AuthenticationError
 from linkedin_mcp_server.dependencies import get_ready_extractor, handle_auth_error
 from linkedin_mcp_server.error_handler import raise_tool_error
 from linkedin_mcp_server.scraping import parse_person_sections
+from linkedin_mcp_server.scraping.extractor import FilterValidationError
 
 logger = logging.getLogger(__name__)
 
@@ -110,6 +112,8 @@ def register_person_tools(
         keywords: str,
         ctx: Context,
         location: str | None = None,
+        network: list[str] | None = None,
+        current_company: str | None = None,
         extractor: Any | None = None,
     ) -> dict[str, Any]:
         """
@@ -119,6 +123,17 @@ def register_person_tools(
             keywords: Search keywords (e.g., "software engineer", "recruiter at Google")
             ctx: FastMCP context for progress reporting
             location: Optional location filter (e.g., "New York", "Remote")
+            network: Optional connection-degree filter. Each element is one of
+                "F" (1st-degree), "S" (2nd-degree), "O" (3rd-degree and beyond).
+                Example: ["F"] to only return 1st-degree connections.
+            current_company: Optional current-employer filter. LinkedIn's
+                currentCompany facet only filters on the numeric company URN id
+                (e.g. "1115" for SAP); plain company names are accepted by the
+                URL but ignored by LinkedIn and return the unfiltered result
+                set. Look up a company's URN via get_company_profile -- it is
+                exposed under references["about"]. For company-wide employee
+                demographics (location/education/function breakdown) plus a
+                slug-based lookup, use get_company_employees instead.
 
         Returns:
             Dict with url, sections (name -> raw text), and optional references.
@@ -129,21 +144,38 @@ def register_person_tools(
                 ctx, tool_name="search_people"
             )
             logger.info(
-                "Searching people: keywords='%s', location='%s'",
+                "Searching people: keywords='%s', location='%s', network=%s, current_company='%s'",
                 keywords,
                 location,
+                network,
+                current_company,
             )
 
             await ctx.report_progress(
                 progress=0, total=100, message="Starting people search"
             )
 
-            result = await extractor.search_people(keywords, location)
+            try:
+                result = await extractor.search_people(
+                    keywords,
+                    location,
+                    network=network,
+                    current_company=current_company,
+                )
+            except FilterValidationError as e:
+                # Validation messages carry actionable detail; surface
+                # them as ToolError so mask_error_details doesn't reduce
+                # them to "Error calling tool 'search_people'".
+                raise ToolError(str(e)) from e
 
             await ctx.report_progress(progress=100, total=100, message="Complete")
 
             return result
 
+        except ToolError:
+            # Already a properly formatted client-facing error; do not
+            # log it as "Unexpected error" via raise_tool_error.
+            raise
         except AuthenticationError as e:
             try:
                 await handle_auth_error(e, ctx)
@@ -267,3 +299,64 @@ def register_person_tools(
                 raise_tool_error(relogin_exc, "get_sidebar_profiles")
         except Exception as e:
             raise_tool_error(e, "get_sidebar_profiles")  # NoReturn
+
+    @mcp.tool(
+        timeout=tool_timeout,
+        title="Get My Profile",
+        annotations={"readOnlyHint": True, "openWorldHint": True},
+        tags={"person", "scraping"},
+        exclude_args=["extractor"],
+    )
+    async def get_my_profile(
+        ctx: Context,
+        sections: str | None = None,
+        max_scrolls: Annotated[int, Field(ge=1, le=50)] | None = None,
+        extractor: Any | None = None,
+    ) -> dict[str, Any]:
+        """
+        Get the authenticated user's own LinkedIn profile.
+
+        Navigates to /in/me/ and resolves the redirect to obtain the real
+        username before scraping, so the url field in the result is the actual
+        profile URL (e.g. linkedin.com/in/johndoe/) rather than /in/me/.
+
+        Args:
+            ctx: FastMCP context for progress reporting
+            sections: Comma-separated list of extra sections to scrape.
+                The main profile page is always included.
+                Available sections: experience, education, interests, honors, languages, certifications, skills, projects, contact_info, posts
+                Examples: "experience,education", "contact_info", "skills,projects"
+                Default (None) scrapes only the main profile page.
+            max_scrolls: Maximum pagination attempts per section (same as get_person_profile).
+
+        Returns:
+            Dict with url, sections (name -> raw text), and optional references.
+            The url field reflects the resolved profile URL, revealing the real username.
+        """
+        try:
+            extractor = extractor or await get_ready_extractor(
+                ctx, tool_name="get_my_profile"
+            )
+            requested, unknown = parse_person_sections(sections)
+
+            logger.info("Scraping own profile (sections=%s)", sections)
+
+            cb = MCPContextProgressCallback(ctx)
+            result = await extractor.get_my_profile(
+                sections=requested,
+                callbacks=cb,
+                max_scrolls=max_scrolls,
+            )
+
+            if unknown:
+                result["unknown_sections"] = unknown
+
+            return result
+
+        except AuthenticationError as e:
+            try:
+                await handle_auth_error(e, ctx)
+            except Exception as relogin_exc:
+                raise_tool_error(relogin_exc, "get_my_profile")
+        except Exception as e:
+            raise_tool_error(e, "get_my_profile")  # NoReturn

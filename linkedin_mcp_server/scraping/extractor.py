@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass
+import json
 import logging
 import re
 from typing import TYPE_CHECKING, Any, Literal
@@ -87,6 +88,10 @@ _JOB_TYPE_MAP = {
 _WORK_TYPE_MAP = {"on_site": "1", "remote": "2", "hybrid": "3"}
 
 _SORT_BY_MAP = {"date": "DD", "relevance": "R"}
+
+# Valid tokens for the people-search ``network`` facet.
+# LinkedIn accepts "F" (1st-degree), "S" (2nd-degree), "O" (3rd-degree and beyond).
+_NETWORK_TOKENS = ("F", "S", "O")
 
 _DIALOG_SELECTOR = 'dialog[open], [role="dialog"]'
 _DIALOG_TEXTAREA_SELECTOR = '[role="dialog"] textarea, dialog textarea'
@@ -268,6 +273,16 @@ def _normalize_csv(value: str, mapping: dict[str, str]) -> str:
     return ",".join(mapping.get(p, p) for p in parts)
 
 
+def _encode_list_facet(values: list[str]) -> str:
+    """Encode a list of string values for a LinkedIn people-search list facet.
+
+    LinkedIn's people-search URL uses JSON-list encoded facets of the form
+    ``["A","B"]``. This helper URL-encodes the rendered JSON so the final URL
+    contains e.g. ``%5B%22F%22%5D`` for ``["F"]``.
+    """
+    return quote_plus(json.dumps(values, separators=(",", ":")))
+
+
 # Patterns that mark the start of LinkedIn page chrome (sidebar/footer).
 # Everything from the earliest match onwards is stripped.
 _NOISE_MARKERS: list[re.Pattern[str]] = [
@@ -302,6 +317,114 @@ class ExtractedSection:
     text: str
     references: list[Reference]
     error: dict[str, Any] | None = None
+
+
+_FEED_RSC_MARKER = "sduiid=com.linkedin.sdui.pagers.feed.mainFeed"
+# Matches a LinkedIn post permalink in either plain or JSON-escaped form
+# (the initial /feed/ HTML embeds the RSC flight data with \u002f for slashes,
+# while paginated responses use plain slashes). Captures the slug portion so
+# we can rebuild a canonical URL regardless of the source encoding.
+_POST_SLUG_URL_RE = re.compile(
+    r"linkedin\.com(?:\\u002[fF]|/)posts(?:\\u002[fF]|/)"
+    r"(?P<slug>[A-Za-z0-9_-]+?-(?:ugcPost|activity|share)-\d+-[A-Za-z0-9_-]+)"
+)
+_FEED_DOCUMENT_URLS = {
+    "https://www.linkedin.com/feed",
+    "https://www.linkedin.com/feed/",
+}
+
+
+def _is_feed_payload_response(url: str) -> bool:
+    """True if the response URL is one that carries `postSlugUrl` fields."""
+    if _FEED_RSC_MARKER in url:
+        return True
+    return url.split("?", 1)[0] in _FEED_DOCUMENT_URLS
+
+
+def _build_feed_references(
+    raw_references: list[Any],
+    captured_urls: list[str],
+) -> list[Reference]:
+    """Compose feed references from DOM anchors + SDUI captures.
+
+    The feed page renders many anchors that are not post permalinks:
+    sidebar widgets, profile cards, employer logos, etc. Mixing them
+    into ``references["feed"]`` blurs the contract and competes with
+    SDUI permalinks for the per-section cap. We keep only the
+    ``feed_post`` slice from the DOM:
+
+    - DOM anchors → ``feed_post`` entries with ``/feed/update/<urn>/``
+      URLs (whatever ``classify_link`` recognises).
+    - SDUI captures → ``feed_post`` entries with ``/posts/<slug>`` URLs
+      for permalinks that the DOM does not surface as an anchor.
+
+    Both are deduped on exact URL string. The two shapes pointing at
+    the same underlying post will *not* collapse — ``dedupe_references``
+    matches strings, not URNs. Both are valid LinkedIn permalinks, so
+    consumers should treat ``feed_post`` as polymorphic on URL form;
+    URN-based equivalence is left to the consumer.
+    """
+    refs = [
+        ref
+        for ref in build_references(raw_references, "feed")
+        if ref["kind"] == "feed_post"
+    ]
+    existing = {r["url"] for r in refs}
+    for sdui_url in captured_urls:
+        # AGENTS.md mandates relative paths for LinkedIn references.
+        # The SDUI capture carries fully-qualified URLs like
+        # https://www.linkedin.com/posts/<slug>; strip the host so the
+        # relative-path convention holds. ``classify_link`` does not
+        # currently route ``/posts/<slug>`` paths to any kind, so we
+        # bypass it for this fallback append.
+        parsed = urlparse(sdui_url)
+        if not parsed.path.startswith("/posts/"):
+            continue
+        relative = parsed.path
+        if relative in existing:
+            continue
+        refs.append({"kind": "feed_post", "url": relative, "context": "feed"})
+        existing.add(relative)
+    # Cap kept in sync with _REFERENCE_CAPS["feed"] in link_metadata.py;
+    # changing one without the other will drop or duplicate entries
+    # silently. Matches get_feed's num_posts ceiling (Field(ge=1, le=50)).
+    return dedupe_references(refs, cap=50)
+
+
+async def _drain_listener_tasks(pending: list[asyncio.Task[None]]) -> None:
+    """Bounded teardown for fire-and-forget response listener tasks.
+
+    The feed scroll loop appends a read task per matching response;
+    those tasks must finish (or be cancelled) before we leave the
+    extractor or the event loop's "Task exception was never retrieved"
+    warnings will surface unrelated errors. The caps below let a stuck
+    ``resp.body()`` call burn at most three seconds of teardown budget.
+    """
+    if not pending:
+        return
+    _done, leftover = await asyncio.wait(pending, timeout=2.0)
+    for task in leftover:
+        task.cancel()
+    try:
+        await asyncio.wait_for(
+            asyncio.gather(*pending, return_exceptions=True),
+            timeout=1.0,
+        )
+    except asyncio.TimeoutError:
+        logger.warning(
+            "SDUI feed listener tasks did not drain after cancel; leaking %d task(s)",
+            sum(1 for t in pending if not t.done()),
+        )
+
+
+class FilterValidationError(ValueError):
+    """Invalid ``search_people`` filter input (network token / URN shape).
+
+    Subclassing ``ValueError`` keeps backward-compatible behaviour for
+    direct extractor callers (``pytest.raises(ValueError)`` matches), while
+    letting the MCP tool wrapper catch this case precisely and surface the
+    actionable message past ``mask_error_details``.
+    """
 
 
 def strip_linkedin_noise(text: str) -> str:
@@ -565,6 +688,7 @@ class LinkedInExtractor:
 
     async def _navigate_to_page(self, url: str) -> None:
         """Navigate to a LinkedIn page and fail fast on auth barriers."""
+        logger.debug("_navigate_to_page: target=%s", url)
         await self._goto_with_auth_checks(url)
 
     # ------------------------------------------------------------------
@@ -773,6 +897,188 @@ class LinkedInExtractor:
             )
             await asyncio.sleep(pause_time)
 
+    async def extract_feed(
+        self,
+        num_posts: int = 10,
+    ) -> ExtractedSection:
+        """Scrape the LinkedIn home feed, scrolling until *num_posts* are loaded."""
+        try:
+            return await self._extract_feed_once(num_posts)
+        except LinkedInScraperException:
+            raise
+        except Exception as e:
+            logger.warning("Failed to extract feed: %s", e)
+            return ExtractedSection(
+                text="",
+                references=[],
+                error=build_issue_diagnostics(e, context="extract_feed"),
+            )
+
+    async def _extract_feed_once(
+        self,
+        num_posts: int,
+    ) -> ExtractedSection:
+        """Single attempt: navigate, scroll until post count, extract."""
+        url = "https://www.linkedin.com/feed/"
+
+        # Post permalinks live in the SDUI pagination response (field:
+        # "postSlugUrl"). The initial /feed/ HTML embeds the same data in
+        # an RSC flight payload. Listen for both during the whole scroll
+        # loop. ``seen_urls`` doubles as the locale-independent scroll
+        # progress signal, replacing the previous "Feed post" innerText
+        # marker that broke on non-English UIs.
+        captured_urls: list[str] = []
+        seen_urls: set[str] = set()
+        pending_reads: list[asyncio.Task[None]] = []
+
+        def _handle_response(resp: Any) -> None:
+            if not _is_feed_payload_response(resp.url):
+                return
+
+            async def _read() -> None:
+                try:
+                    body = await resp.body()
+                except Exception:
+                    return
+                if not body:
+                    return
+                text = body.decode("utf-8", errors="replace")
+                for match in _POST_SLUG_URL_RE.finditer(text):
+                    post_url = f"https://www.linkedin.com/posts/{match.group('slug')}"
+                    if post_url not in seen_urls:
+                        seen_urls.add(post_url)
+                        captured_urls.append(post_url)
+
+            pending_reads.append(asyncio.create_task(_read()))
+
+        self._page.on("response", _handle_response)
+        try:
+            return await self._extract_feed_body(
+                url, num_posts, captured_urls, pending_reads
+            )
+        finally:
+            try:
+                self._page.remove_listener("response", _handle_response)
+            except Exception:
+                pass
+            await _drain_listener_tasks(pending_reads)
+
+    async def _extract_feed_body(
+        self,
+        url: str,
+        num_posts: int,
+        captured_urls: list[str],
+        pending_reads: list[asyncio.Task[None]],
+    ) -> ExtractedSection:
+        await self._navigate_to_page(url)
+        await detect_rate_limit(self._page)
+
+        try:
+            await self._page.wait_for_selector("main")
+        except PlaywrightTimeoutError:
+            logger.debug("No <main> element found on %s", url)
+
+        await handle_modal_close(self._page)
+
+        try:
+            await self._page.wait_for_function(
+                """() => {
+                    const main = document.querySelector('main');
+                    if (!main) return false;
+                    return main.innerText.length > 200;
+                }""",
+                timeout=10000,
+            )
+        except PlaywrightTimeoutError:
+            logger.debug("Feed content did not appear on %s", url)
+
+        # The feed has its own scroll container — window.scrollTo is a no-op.
+        # mouse.wheel over the viewport center triggers the real scroll.
+        _MAX_SCROLLS = 12
+        _MAX_STALE = 3
+        _BATCH_WAIT = 6.0
+        _WHEEL_DELTA = 2000
+        _IN_LOOP_DRAIN_TIMEOUT = 1.0
+        stale_count = 0
+
+        viewport = self._page.viewport_size or {"width": 1280, "height": 720}
+        cx, cy = viewport["width"] // 2, viewport["height"] // 2
+        await self._page.mouse.move(cx, cy)
+
+        for i in range(_MAX_SCROLLS):
+            count = len(captured_urls)
+            logger.debug("Feed scroll %d: %d permalinks captured", i, count)
+            if count >= num_posts:
+                break
+
+            await self._page.mouse.wheel(0, _WHEEL_DELTA)
+
+            new_count = count
+            for _ in range(int(_BATCH_WAIT)):
+                await asyncio.sleep(1.0)
+                # Drain in-flight response reads so captured_urls reflects
+                # everything Playwright already delivered. Without this,
+                # the count comparison races: the wheel fires a network
+                # response, the listener creates a read task, and the loop
+                # sleeps and re-checks before _read() finishes appending —
+                # producing false-stale verdicts.
+                if pending_reads:
+                    done, _still = await asyncio.wait(
+                        pending_reads, timeout=_IN_LOOP_DRAIN_TIMEOUT
+                    )
+                    if done:
+                        # Surface unexpected exceptions. _read() catches
+                        # expected playwright errors, but a parser bug
+                        # would otherwise vanish into the loop. Log them
+                        # rather than raising so a single bad response
+                        # doesn't abort the whole scroll session.
+                        for result in await asyncio.gather(
+                            *done, return_exceptions=True
+                        ):
+                            if isinstance(result, BaseException):
+                                logger.warning(
+                                    "Unhandled error in feed _read task: %r",
+                                    result,
+                                )
+                    pending_reads[:] = [t for t in pending_reads if not t.done()]
+                new_count = len(captured_urls)
+                if new_count > count:
+                    break
+
+            if new_count > count:
+                stale_count = 0
+            else:
+                stale_count += 1
+                logger.debug(
+                    "Feed stale scroll %d/%d (still at %d permalinks)",
+                    stale_count,
+                    _MAX_STALE,
+                    new_count,
+                )
+                if stale_count >= _MAX_STALE:
+                    logger.debug("Feed stopped producing new posts")
+                    break
+
+        # Give any in-flight response reads a beat to finish recording URLs.
+        await asyncio.sleep(0.2)
+
+        raw_result = await self._extract_root_content(["main"])
+        raw = raw_result["text"]
+
+        if not raw:
+            return ExtractedSection(text="", references=[])
+        truncated = _truncate_linkedin_noise(raw)
+        if not truncated and raw.strip():
+            logger.warning(
+                "Page %s returned only LinkedIn chrome (likely rate-limited)", url
+            )
+            return ExtractedSection(text=_RATE_LIMITED_MSG, references=[])
+        cleaned = _filter_linkedin_noise_lines(truncated)
+        return ExtractedSection(
+            text=cleaned,
+            references=_build_feed_references(raw_result["references"], captured_urls),
+        )
+
     async def extract_page(
         self,
         url: str,
@@ -822,6 +1128,21 @@ class LinkedInExtractor:
     ) -> ExtractedSection:
         """Single attempt to navigate, scroll, and extract innerText."""
         await self._navigate_to_page(url)
+        return await self._extract_loaded_section(url, section_name, max_scrolls)
+
+    async def _extract_loaded_section(
+        self,
+        url: str,
+        section_name: str,
+        max_scrolls: int | None = None,
+    ) -> ExtractedSection:
+        """Run the post-navigation extraction pipeline on the current page.
+
+        Assumes ``self._page`` already points at ``url`` (or its post-redirect
+        equivalent). Performs rate-limit detection, modal dismissal, lazy-load
+        scrolling, innerText extraction, noise truncation, and reference
+        building — everything ``_extract_page_once`` does after the goto.
+        """
         await detect_rate_limit(self._page)
 
         # Wait for main content to render
@@ -863,6 +1184,27 @@ class LinkedInExtractor:
                 )
             except PlaywrightTimeoutError:
                 logger.debug("Search results content did not appear on %s", url)
+
+        # Company people pages (/company/<slug>/people/) initially render only
+        # the company header in <main>; the employee listing hydrates later
+        # via JS. Wait until at least one /in/ profile anchor appears inside
+        # <main> so innerText extraction sees the actual list. Use a 5s
+        # timeout instead of the 10s pattern shared with is_search/is_details
+        # — empty/restricted listings are common here (small companies,
+        # privacy settings) and a full 10s wait per call adds up.
+        is_company_people = "/company/" in url and "/people/" in url
+        if is_company_people:
+            try:
+                await self._page.wait_for_function(
+                    """() => {
+                        const main = document.querySelector('main');
+                        if (!main) return false;
+                        return main.querySelectorAll('a[href*="/in/"]').length > 0;
+                    }""",
+                    timeout=5000,
+                )
+            except PlaywrightTimeoutError:
+                logger.debug("Company people listing did not appear on %s", url)
 
         # Profile detail pages (/details/experience/, /details/education/, etc.)
         # initially render sidebar recommendations into <main> while the section
@@ -1022,8 +1364,17 @@ class LinkedInExtractor:
         requested: set[str],
         callbacks: ProgressCallback | None = None,
         max_scrolls: int | None = None,
+        *,
+        main_profile_already_loaded: bool = False,
     ) -> dict[str, Any]:
         """Scrape a person profile with configurable sections.
+
+        When ``main_profile_already_loaded`` is True and ``self._page`` is on
+        the exact profile root for ``username``, the ``main_profile`` section
+        is extracted from the current page without re-navigating. Falls back
+        to ``extract_page`` if the URL drifts or the reuse path returns the
+        soft-rate-limit sentinel (preserving the retry semantics of
+        ``extract_page``).
 
         Returns:
             {url, sections: {name: text}, profile_urn?: str}
@@ -1052,7 +1403,29 @@ class LinkedInExtractor:
 
                 url = base_url + suffix
                 try:
-                    if is_overlay:
+                    can_reuse_main = (
+                        section_name == "main_profile"
+                        and main_profile_already_loaded
+                        and urlparse(self._page.url).path.rstrip("/")
+                        == f"/in/{username}"
+                    )
+                    if can_reuse_main:
+                        extracted = await self._extract_loaded_section(
+                            url,
+                            section_name=section_name,
+                            max_scrolls=max_scrolls,
+                        )
+                        if extracted.text == _RATE_LIMITED_MSG:
+                            logger.info(
+                                "Reuse path soft-rate-limited; falling back "
+                                "to extract_page for retry parity"
+                            )
+                            extracted = await self.extract_page(
+                                url,
+                                section_name=section_name,
+                                max_scrolls=max_scrolls,
+                            )
+                    elif is_overlay:
                         extracted = await self._extract_overlay(
                             url, section_name=section_name
                         )
@@ -1110,6 +1483,35 @@ class LinkedInExtractor:
             await callbacks.on_complete("person profile", result)
 
         return result
+
+    async def get_my_profile(
+        self,
+        sections: set[str] | None = None,
+        callbacks: ProgressCallback | None = None,
+        max_scrolls: int | None = None,
+    ) -> dict[str, Any]:
+        """Scrape the authenticated user's own LinkedIn profile.
+
+        Navigates to /in/me/ and resolves the redirect to obtain the real
+        username before scraping, so result["url"] reflects the actual profile
+        URL rather than /in/me/.
+
+        Returns:
+            {url, sections: {name: text}}
+        """
+        await self._navigate_to_page("https://www.linkedin.com/in/me/")
+        real_url = self._page.url  # post-redirect, e.g. /in/johndoe/
+        match = re.search(r"/in/([^/?#]+)", real_url)
+        username = match.group(1) if match else "me"
+        logger.debug("get_my_profile resolved username=%r from %s", username, real_url)
+
+        return await self.scrape_person(
+            username,
+            sections if sections is not None else {"main_profile"},
+            callbacks=callbacks,
+            max_scrolls=max_scrolls,
+            main_profile_already_loaded=True,
+        )
 
     async def _read_action_signals(self, username: str) -> ActionSignals:
         """Read locale-independent structural signals for a profile's
@@ -1997,6 +2399,41 @@ class LinkedInExtractor:
 
         return result
 
+    async def get_company_employees(
+        self,
+        company_name: str,
+        keywords: str | None = None,
+    ) -> dict[str, Any]:
+        """List employees at a company from the /people/ page.
+
+        Returns:
+            {url, sections: {employees: text}, references: {employees: [...]}}
+        """
+        url = f"https://www.linkedin.com/company/{company_name}/people/"
+        if keywords:
+            url += f"?keywords={quote_plus(keywords)}"
+        extracted = await self.extract_page(url, section_name="employees")
+
+        sections: dict[str, str] = {}
+        references: dict[str, list[Reference]] = {}
+        section_errors: dict[str, dict[str, Any]] = {}
+        if extracted.text and extracted.text != _RATE_LIMITED_MSG:
+            sections["employees"] = extracted.text
+            if extracted.references:
+                references["employees"] = extracted.references
+        elif extracted.error:
+            section_errors["employees"] = extracted.error
+
+        result: dict[str, Any] = {
+            "url": url,
+            "sections": sections,
+        }
+        if references:
+            result["references"] = references
+        if section_errors:
+            result["section_errors"] = section_errors
+        return result
+
     async def scrape_job(self, job_id: str) -> dict[str, Any]:
         """Scrape a single job posting.
 
@@ -2502,17 +2939,86 @@ class LinkedInExtractor:
         self,
         keywords: str,
         location: str | None = None,
+        network: list[str] | None = None,
+        current_company: str | None = None,
     ) -> dict[str, Any]:
         """Search for people and extract the results page.
+
+        Args:
+            keywords: Free-text query ("software engineer", "recruiter at Google").
+            location: Optional location filter ("New York", "Remote").
+            network: Optional connection-degree filter. Each element is one of
+                ``"F"`` (1st-degree), ``"S"`` (2nd-degree), ``"O"`` (3rd-degree
+                and beyond). Example: ``["F"]`` to only return 1st-degree
+                connections. Invalid tokens raise ``ValueError``.
+            current_company: Optional current-employer filter. LinkedIn's
+                ``currentCompany`` facet only filters on the numeric company
+                URN id (e.g. ``"1115"`` for SAP); plain company names are
+                accepted by the URL but ignored by LinkedIn and return the
+                unfiltered result set. Look up a company's URN via
+                ``get_company_profile`` -- it is exposed under
+                ``references["about"]``.
 
         Returns:
             {url, sections: {name: text}}
         """
+        if network is not None:
+            invalid = [t for t in network if t not in _NETWORK_TOKENS]
+            if invalid:
+                raise FilterValidationError(
+                    "Invalid network token(s) "
+                    f"{invalid!r}; expected any of {list(_NETWORK_TOKENS)!r}"
+                )
+
+        if current_company and not re.fullmatch(r"[0-9]+", current_company):
+            raise FilterValidationError(
+                f"current_company must be a numeric LinkedIn company URN id "
+                f"(e.g. '1115' for SAP); got {current_company!r}. Plain-text "
+                f"company names are silently ignored by LinkedIn. Look up the "
+                f'URN via get_company_profile -> references["about"].'
+            )
+
         params = f"keywords={quote_plus(keywords)}"
         if location:
             params += f"&location={quote_plus(location)}"
+        if network:
+            params += f"&network={_encode_list_facet(network)}"
+        if current_company:
+            params += f"&currentCompany={_encode_list_facet([current_company])}"
 
         url = f"https://www.linkedin.com/search/results/people/?{params}"
+        extracted = await self.extract_page(url, section_name="search_results")
+
+        sections: dict[str, str] = {}
+        references: dict[str, list[Reference]] = {}
+        section_errors: dict[str, dict[str, Any]] = {}
+        if extracted.text and extracted.text != _RATE_LIMITED_MSG:
+            sections["search_results"] = extracted.text
+            if extracted.references:
+                references["search_results"] = extracted.references
+        elif extracted.error:
+            section_errors["search_results"] = extracted.error
+
+        result: dict[str, Any] = {
+            "url": url,
+            "sections": sections,
+        }
+        if references:
+            result["references"] = references
+        if section_errors:
+            result["section_errors"] = section_errors
+        return result
+
+    async def search_companies(
+        self,
+        keywords: str,
+    ) -> dict[str, Any]:
+        """Search for companies and extract the results page.
+
+        Returns:
+            {url, sections: {search_results: text}}
+        """
+        url = f"https://www.linkedin.com/search/results/companies/?keywords={quote_plus(keywords)}"
         extracted = await self.extract_page(url, section_name="search_results")
 
         sections: dict[str, str] = {}

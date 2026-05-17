@@ -17,6 +17,7 @@ from linkedin_mcp_server.scraping.extractor import (
     ExtractedSection,
     LinkedInExtractor,
     _RATE_LIMITED_MSG,
+    _build_feed_references,
     _truncate_linkedin_noise,
     strip_linkedin_noise,
 )
@@ -1607,6 +1608,70 @@ class TestScrapeCompany:
         assert "about" not in result["sections"]
         assert result["sections"]["posts"] == "Posts text"
 
+    async def test_scrape_company_extracts_company_urn(self, mock_page):
+        """End-to-end: a canned-search anchor on the company about page
+        produces a ``company_urn`` reference with the parent-company id.
+
+        Stubs ``_extract_root_content`` (rather than ``extract_page``) so
+        the real ``build_references`` pipeline runs against raw anchor
+        data, mirroring what the JS crawler emits live.
+        """
+        extractor = LinkedInExtractor(mock_page)
+        raw_root = {
+            "source": "root",
+            "text": "About SAP\nCompany overview",
+            "references": [
+                {
+                    "href": "https://www.linkedin.com/search/results/people/"
+                    "?currentCompany=%5B%221115%22%5D"
+                    "&origin=COMPANY_PAGE_CANNED_SEARCH",
+                    "text": "10K+ employees",
+                    "aria_label": "",
+                    "title": "",
+                    "heading": "",
+                    "in_article": False,
+                    "in_nav": False,
+                    "in_footer": False,
+                }
+            ],
+        }
+        with (
+            patch.object(
+                extractor,
+                "_extract_root_content",
+                new_callable=AsyncMock,
+                return_value=raw_root,
+            ),
+            patch(
+                "linkedin_mcp_server.scraping.extractor.scroll_to_bottom",
+                new_callable=AsyncMock,
+            ),
+            patch(
+                "linkedin_mcp_server.scraping.extractor.detect_rate_limit",
+                new_callable=AsyncMock,
+            ),
+            patch(
+                "linkedin_mcp_server.scraping.extractor.handle_modal_close",
+                new_callable=AsyncMock,
+                return_value=False,
+            ),
+            patch(
+                "linkedin_mcp_server.scraping.extractor.asyncio.sleep",
+                new_callable=AsyncMock,
+            ),
+        ):
+            result = await extractor.scrape_company("sap", {"about"})
+
+        urns = [
+            ref for ref in result["references"]["about"] if ref["kind"] == "company_urn"
+        ]
+        assert len(urns) == 1
+        assert urns[0]["value"] == "1115"
+        assert urns[0]["url"] == (
+            "/search/results/people/?currentCompany=%5B%221115%22%5D"
+        )
+        assert "text" not in urns[0]
+
 
 class TestScrapeJob:
     async def test_scrape_job(self, mock_page):
@@ -2162,6 +2227,91 @@ class TestSearchJobs:
 
         assert result["sections"] == {}
         assert "references" not in result
+
+    async def test_search_people_network_filter_first_degree(self, mock_page):
+        extractor = LinkedInExtractor(mock_page)
+        with patch.object(
+            extractor,
+            "extract_page",
+            new_callable=AsyncMock,
+            return_value=extracted("Jane Doe"),
+        ):
+            result = await extractor.search_people("engineer", network=["F"])
+
+        assert "network=%5B%22F%22%5D" in result["url"]
+
+    async def test_search_people_network_filter_multi_degree(self, mock_page):
+        extractor = LinkedInExtractor(mock_page)
+        with patch.object(
+            extractor,
+            "extract_page",
+            new_callable=AsyncMock,
+            return_value=extracted("Jane Doe"),
+        ):
+            result = await extractor.search_people("engineer", network=["F", "S"])
+
+        assert "network=%5B%22F%22%2C%22S%22%5D" in result["url"]
+
+    async def test_search_people_current_company_filter(self, mock_page):
+        extractor = LinkedInExtractor(mock_page)
+        with patch.object(
+            extractor,
+            "extract_page",
+            new_callable=AsyncMock,
+            return_value=extracted("Jane Doe"),
+        ):
+            result = await extractor.search_people("engineer", current_company="1115")
+
+        assert "currentCompany=%5B%221115%22%5D" in result["url"]
+
+    async def test_search_people_invalid_network_token_raises(self, mock_page):
+        extractor = LinkedInExtractor(mock_page)
+        with pytest.raises(ValueError, match="Invalid network token"):
+            await extractor.search_people("engineer", network=["X"])
+
+    async def test_search_people_rejects_plain_company_name(self, mock_page):
+        extractor = LinkedInExtractor(mock_page)
+        with pytest.raises(ValueError, match="must be a numeric"):
+            await extractor.search_people("engineer", current_company="SAP")
+
+    async def test_search_people_rejects_unicode_digit_company(self, mock_page):
+        """LinkedIn URN ids are ASCII decimal; reject Unicode digits even
+        though ``str.isdigit()`` would accept them."""
+        extractor = LinkedInExtractor(mock_page)
+        with pytest.raises(ValueError, match="must be a numeric"):
+            await extractor.search_people("engineer", current_company="١١١٥")
+
+    async def test_search_people_empty_current_company_is_noop(self, mock_page):
+        extractor = LinkedInExtractor(mock_page)
+        with patch.object(
+            extractor,
+            "extract_page",
+            new_callable=AsyncMock,
+            return_value=extracted("Jane Doe"),
+        ):
+            result = await extractor.search_people("engineer", current_company="")
+
+        assert "currentCompany" not in result["url"]
+
+    async def test_search_people_combines_all_filters(self, mock_page):
+        extractor = LinkedInExtractor(mock_page)
+        with patch.object(
+            extractor,
+            "extract_page",
+            new_callable=AsyncMock,
+            return_value=extracted("Jane Doe"),
+        ):
+            result = await extractor.search_people(
+                "engineer",
+                location="Seattle",
+                network=["F"],
+                current_company="1115",
+            )
+
+        assert "keywords=engineer" in result["url"]
+        assert "location=Seattle" in result["url"]
+        assert "network=%5B%22F%22%5D" in result["url"]
+        assert "currentCompany=%5B%221115%22%5D" in result["url"]
 
 
 class TestScrapeSavedJobs:
@@ -2877,6 +3027,92 @@ class TestActivityFeedExtraction:
         assert result.text == tab_headers
 
 
+class TestCompanyPeopleExtraction:
+    """Tests for /company/<slug>/people/ hydration wait in _extract_page_once."""
+
+    async def test_waits_for_listing_with_5s_timeout(self, mock_page):
+        """Company /people/ pages call wait_for_function so the employee
+        listing has hydrated before scroll/extract. Empty/restricted listings
+        are common, so the timeout is 5s rather than the 10s pattern shared
+        with is_search/is_details."""
+        mock_page.evaluate = AsyncMock(
+            return_value={
+                "source": "root",
+                "text": "Anthropic\nFollowing\nHome\nAbout\nPeople",
+                "references": [],
+            }
+        )
+        mock_page.wait_for_function = AsyncMock()
+        extractor = LinkedInExtractor(mock_page)
+        with (
+            patch(
+                "linkedin_mcp_server.scraping.extractor.scroll_to_bottom",
+                new_callable=AsyncMock,
+            ) as mock_scroll,
+            patch(
+                "linkedin_mcp_server.scraping.extractor.detect_rate_limit",
+                new_callable=AsyncMock,
+            ),
+            patch(
+                "linkedin_mcp_server.scraping.extractor.handle_modal_close",
+                new_callable=AsyncMock,
+                return_value=False,
+            ),
+        ):
+            await extractor._extract_page_once(
+                "https://www.linkedin.com/company/anthropicresearch/people/",
+                section_name="employees",
+            )
+
+        mock_page.wait_for_function.assert_awaited_once()
+        wait_predicate = mock_page.wait_for_function.call_args[0][0]
+        wait_kwargs = mock_page.wait_for_function.call_args.kwargs
+        assert "/in/" in wait_predicate
+        assert "querySelectorAll" in wait_predicate
+        assert wait_kwargs["timeout"] == 5000
+        mock_scroll.assert_awaited_once()
+
+    async def test_continues_extraction_on_wait_timeout(self, mock_page):
+        """When the hydration wait times out (genuinely empty listing), the
+        extractor swallows PlaywrightTimeoutError and still scrolls + extracts
+        rather than propagating the error to the caller."""
+        from patchright.async_api import TimeoutError as PlaywrightTimeoutError
+
+        mock_page.evaluate = AsyncMock(
+            return_value={
+                "source": "root",
+                "text": "Empty company page",
+                "references": [],
+            }
+        )
+        mock_page.wait_for_function = AsyncMock(
+            side_effect=PlaywrightTimeoutError("Timeout")
+        )
+        extractor = LinkedInExtractor(mock_page)
+        with (
+            patch(
+                "linkedin_mcp_server.scraping.extractor.scroll_to_bottom",
+                new_callable=AsyncMock,
+            ) as mock_scroll,
+            patch(
+                "linkedin_mcp_server.scraping.extractor.detect_rate_limit",
+                new_callable=AsyncMock,
+            ),
+            patch(
+                "linkedin_mcp_server.scraping.extractor.handle_modal_close",
+                new_callable=AsyncMock,
+                return_value=False,
+            ),
+        ):
+            result = await extractor._extract_page_once(
+                "https://www.linkedin.com/company/anthropicresearch/people/",
+                section_name="employees",
+            )
+
+        mock_scroll.assert_awaited_once()
+        assert result.text  # non-empty placeholder text from the mock
+
+
 class TestSearchResultsExtraction:
     """Tests for search results page detection and wait behavior in _extract_page_once."""
 
@@ -3079,6 +3315,116 @@ class TestScrapePersonCallbacks:
         assert isinstance(error_arg, LinkedInScraperException)
         assert "boom" in str(error_arg)
         cb.on_complete.assert_not_awaited()
+
+
+class TestMainProfileAlreadyLoaded:
+    """Reuse path for scrape_person when get_my_profile already loaded the page."""
+
+    async def test_get_my_profile_passes_already_loaded_flag(self, mock_page):
+        extractor = LinkedInExtractor(mock_page)
+        mock_page.url = "https://www.linkedin.com/in/realuser/"
+        with (
+            patch.object(extractor, "_navigate_to_page", new_callable=AsyncMock) as nav,
+            patch.object(
+                extractor,
+                "scrape_person",
+                new_callable=AsyncMock,
+                return_value={"url": "...", "sections": {}},
+            ) as scrape,
+        ):
+            await extractor.get_my_profile(sections={"main_profile"})
+
+        nav.assert_awaited_once_with("https://www.linkedin.com/in/me/")
+        assert scrape.await_count == 1
+        assert scrape.call_args.kwargs["main_profile_already_loaded"] is True
+
+    async def test_scrape_person_already_loaded_skips_navigation(self, mock_page):
+        extractor = LinkedInExtractor(mock_page)
+        mock_page.url = "https://www.linkedin.com/in/foo/"
+        with (
+            patch.object(
+                extractor,
+                "_extract_loaded_section",
+                new_callable=AsyncMock,
+                return_value=extracted("reused"),
+            ) as loaded,
+            patch.object(
+                extractor, "extract_page", new_callable=AsyncMock
+            ) as extract_page,
+            patch.object(extractor, "_navigate_to_page", new_callable=AsyncMock) as nav,
+            patch(
+                "linkedin_mcp_server.scraping.extractor.asyncio.sleep",
+                new_callable=AsyncMock,
+            ),
+        ):
+            await extractor.scrape_person(
+                "foo", {"main_profile"}, main_profile_already_loaded=True
+            )
+
+        loaded.assert_awaited_once()
+        extract_page.assert_not_awaited()
+        nav.assert_not_awaited()
+
+    async def test_scrape_person_already_loaded_url_mismatch_falls_back(
+        self, mock_page
+    ):
+        extractor = LinkedInExtractor(mock_page)
+        mock_page.url = "https://www.linkedin.com/feed/"
+        with (
+            patch.object(
+                extractor,
+                "extract_page",
+                new_callable=AsyncMock,
+                return_value=extracted("fallback"),
+            ) as extract_page,
+            patch.object(
+                extractor,
+                "_extract_loaded_section",
+                new_callable=AsyncMock,
+            ) as loaded,
+            patch(
+                "linkedin_mcp_server.scraping.extractor.asyncio.sleep",
+                new_callable=AsyncMock,
+            ),
+        ):
+            await extractor.scrape_person(
+                "foo", {"main_profile"}, main_profile_already_loaded=True
+            )
+
+        extract_page.assert_awaited_once()
+        loaded.assert_not_awaited()
+
+    async def test_scrape_person_already_loaded_rate_limit_falls_back(self, mock_page):
+        extractor = LinkedInExtractor(mock_page)
+        mock_page.url = "https://www.linkedin.com/in/foo/"
+
+        from linkedin_mcp_server.scraping.extractor import _RATE_LIMITED_MSG
+
+        with (
+            patch.object(
+                extractor,
+                "_extract_loaded_section",
+                new_callable=AsyncMock,
+                return_value=extracted(_RATE_LIMITED_MSG),
+            ) as loaded,
+            patch.object(
+                extractor,
+                "extract_page",
+                new_callable=AsyncMock,
+                return_value=extracted("retry succeeded"),
+            ) as extract_page,
+            patch(
+                "linkedin_mcp_server.scraping.extractor.asyncio.sleep",
+                new_callable=AsyncMock,
+            ),
+        ):
+            result = await extractor.scrape_person(
+                "foo", {"main_profile"}, main_profile_already_loaded=True
+            )
+
+        loaded.assert_awaited_once()
+        extract_page.assert_awaited_once()
+        assert result["sections"]["main_profile"] == "retry succeeded"
 
 
 class TestScrapeCompanyCallbacks:
@@ -4375,3 +4721,107 @@ class TestSendMessageComposerInteraction:
         assert result["status"] == "sent"
         # Enter was pressed as fallback
         mock_keyboard.press.assert_awaited_once_with("Enter")
+
+
+class TestBuildFeedReferences:
+    """Tests for _build_feed_references SDUI-capture / DOM-anchor merging."""
+
+    def test_sdui_urls_become_relative_feed_post_references(self):
+        captured = [
+            "https://www.linkedin.com/posts/alice_some-slug-ugcPost-1-xx",
+            "https://www.linkedin.com/posts/bob_other-post-share-2-yy",
+        ]
+        refs = _build_feed_references([], captured)
+        assert refs == [
+            {
+                "kind": "feed_post",
+                "url": "/posts/alice_some-slug-ugcPost-1-xx",
+                "context": "feed",
+            },
+            {
+                "kind": "feed_post",
+                "url": "/posts/bob_other-post-share-2-yy",
+                "context": "feed",
+            },
+        ]
+
+    def test_duplicate_sdui_urls_are_deduped(self):
+        captured = [
+            "https://www.linkedin.com/posts/alice_x-ugcPost-1-xx",
+            "https://www.linkedin.com/posts/alice_x-ugcPost-1-xx",
+        ]
+        refs = _build_feed_references([], captured)
+        assert len(refs) == 1
+        assert refs[0]["url"] == "/posts/alice_x-ugcPost-1-xx"
+
+    def test_dom_anchor_feed_update_passes_through(self):
+        # DOM anchors that classify_link recognises as feed_post survive
+        # the merge alongside SDUI captures.
+        raw_anchors = [
+            {
+                "href": "https://www.linkedin.com/feed/update/urn:li:activity:1234567890/",
+                "text": "View post",
+            }
+        ]
+        refs = _build_feed_references(raw_anchors, [])
+        assert any(
+            r["url"] == "/feed/update/urn:li:activity:1234567890/"
+            and r["kind"] == "feed_post"
+            for r in refs
+        )
+
+    def test_non_posts_paths_in_sdui_capture_are_skipped(self):
+        # Defensive: only /posts/<slug> shapes count for SDUI append.
+        captured = [
+            "https://www.linkedin.com/in/someuser/",
+            "https://www.linkedin.com/posts/alice_x-ugcPost-1-xx",
+        ]
+        refs = _build_feed_references([], captured)
+        assert [r["url"] for r in refs] == ["/posts/alice_x-ugcPost-1-xx"]
+
+    def test_cap_matches_num_posts_ceiling(self):
+        captured = [
+            f"https://www.linkedin.com/posts/p{i}-ugcPost-{i}-xx" for i in range(60)
+        ]
+        refs = _build_feed_references([], captured)
+        # Cap is 50, mirroring _REFERENCE_CAPS["feed"] / num_posts <= 50.
+        assert len(refs) == 50
+
+    def test_non_feed_post_dom_anchors_are_filtered(self):
+        # Sidebar profile / company / external anchors must not crowd
+        # out SDUI permalinks — references["feed"] is feed_post-only.
+        raw_anchors = [
+            {
+                "href": "https://www.linkedin.com/in/sidebar-user/",
+                "text": "Sidebar User",
+            },
+            {
+                "href": "https://www.linkedin.com/company/some-corp/",
+                "text": "Some Corp",
+            },
+            {
+                "href": "https://example.com/external/",
+                "text": "External Link",
+            },
+        ]
+        refs = _build_feed_references(raw_anchors, [])
+        assert refs == []
+
+    def test_feed_post_dom_anchors_coexist_with_sdui_captures(self):
+        # The two sources fold into the same feed_post kind without
+        # collapsing across URL shapes pointing at the same post.
+        raw_anchors = [
+            {
+                "href": "https://www.linkedin.com/feed/update/urn:li:activity:111/",
+                "text": "View post",
+            }
+        ]
+        captured = ["https://www.linkedin.com/posts/alice_x-ugcPost-1-xx"]
+        refs = _build_feed_references(raw_anchors, captured)
+        urls = [r["url"] for r in refs]
+        kinds = {r["kind"] for r in refs}
+        assert urls == [
+            "/feed/update/urn:li:activity:111/",
+            "/posts/alice_x-ugcPost-1-xx",
+        ]
+        assert kinds == {"feed_post"}
